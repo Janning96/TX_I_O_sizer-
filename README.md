@@ -1,18 +1,14 @@
-# TXIO Sizer – Upload‑only Build
 
-Repo: **Janning96/TX_I_O_sizer-**
+# TXIO Sizer PRO – Upload‑only (vollständiger Build)
 
-## Deploy (nur hochladen)
-
-1. Lade den **Ordner `/docs`** (Inhalt) in dein Repo.
-2. GitHub → **Settings → Pages** → Source: *Deploy from a branch* → Branch **main**, Folder **/docs** → **Save**.
-3. Öffne: `https://Janning96.github.io/TX_I_O_sizer-/`
-
-> Kein Build, keine Node‑Installation nötig.
+Deploy: Den **Inhalt des Ordners `/docs`** in dein GitHub‑Repository unter `/docs` legen → GitHub Pages: Branch `main`, Folder `/docs`.
 
 ## Features
-- I/O‑Reserve (Gesamtsumme), Controller‑Wahl inkl. KNX/Modbus/M‑Bus‑Caps
-- Modul‑Packing (inkl. AO 4–20 mA nur auf TXM1.8X 5–8), mA‑Budget, TXS‑Ermittlung
-- Baureihen‑Breite (DIN‑Schiene) → automatisch Zeilen
-- Ergebnis‑Tabelle im SAP‑Layout + CSV‑Copy
-- Geräte‑Info‑Viewer
+- Preis‑Import (Excel/CSV): A=Leistungsnummer, B=Listenpreis
+- Kostenfelder in Ergebnis (Einzelpreis, Zwischensumme, Gesamtkosten via Excel/PDF)
+- Optimierung: Günstigste / Empfehlung / Beides
+- Controller‑Filter: Kompakt (PXC4/5) / Modular (PXC7)
+- Modul‑Feature‑Filter: Lokale Übersteuerung, LCD, 3‑farbig, Grün
+- Exporte: XLSX (voll), XLSX (nur LN+Menge), PDF; Clipboard‑Copy (LN+Menge)
+- Presets: Klein / Mittel / Groß
+- Geräte‑Info‑Viewer & Rechenweg‑Panel
