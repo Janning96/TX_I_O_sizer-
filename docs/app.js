@@ -1,2 +1,201 @@
-import { CONTROLLERS } from './catalog.js';
-document.getElementById('app').innerHTML = '<p>Es wurden ' + CONTROLLERS.length + ' Controller geladen.</p>';
+
+import { computePlan } from './logic.js';
+import { CONTROLLERS, MODULES } from './catalog.js';
+
+const $ = sel => document.querySelector(sel);
+const h = (tag, props={}, ...kids)=>{
+  const el=document.createElement(tag);
+  Object.entries(props).forEach(([k,v])=>{
+    if(k==="class") el.className=v;
+    else if(k.startsWith("on")) el.addEventListener(k.slice(2).toLowerCase(), v);
+    else el.setAttribute(k, v);
+  });
+  kids.flat().forEach(k=> el.append(k instanceof Node?k:document.createTextNode(k)));
+  return el;
+};
+
+const defaultInputs = {
+  points:{di:0,doRelay:0,doTriac:0,aiU:0,ai_mA:0,aiRTD:0,aoU:0,ao_mA:0,counters:0},
+  dpReservePct:0.20,
+  comm:{knx:{devices:0},modbus:{tcpNetworks:0,rtuSegments:0},mbus:{devices:0}},
+  cabinet:{railWidth_mm:600},
+  constraints:{eventMode:false}
+};
+
+let state = JSON.parse(localStorage.getItem("txio_state")||"null") || defaultInputs;
+const save=()=> localStorage.setItem("txio_state", JSON.stringify(state));
+
+function numberInput(label, path){
+  const inp = h("input",{class:"input", type:"number", min:"0", value:get(path)??0, oninput:e=>{ set(path, Number(e.target.value||0)); }});
+  return h("div",{}, h("div",{class:"label"},label), inp);
+}
+function get(path){
+  return path.split(".").reduce((o,k)=> o?.[k], state);
+}
+function set(path, val){
+  const keys = path.split(".");
+  let o=state;
+  keys.slice(0,-1).forEach(k=> o=o[k]=o[k]??{} );
+  o[keys.at(-1)] = val; save();
+}
+
+function buildInputs(){
+  const left = h("div",{class:"card"}, 
+    h("div",{class:"section-title"}, h("h3",{},"Eingaben"),
+      h("div",{class:"row"},
+        h("button",{class:"icon-btn",onclick:()=>{ state=JSON.parse(JSON.stringify(defaultInputs)); save(); render(); }},"Zurücksetzen"),
+        h("button",{class:"btn",onclick:run},"Ausführen")
+      )
+    ),
+    h("div",{class:"grid", style:"grid-template-columns:repeat(2,minmax(0,1fr))"},
+      h("div",{class:"card"},
+        h("div",{class:"label"},"Datenpunkte"),
+        h("div",{class:"grid", style:"grid-template-columns:repeat(2,minmax(0,1fr))"},
+          numberInput("DI","points.di"), numberInput("DO (Relais)","points.doRelay"),
+          numberInput("DO (Triac)","points.doTriac"), numberInput("AI 0–10V","points.aiU"),
+          numberInput("AI 4–20mA","points.ai_mA"), numberInput("AI RTD/PT","points.aiRTD"),
+          numberInput("AO 0–10V","points.aoU"), numberInput("AO 4–20mA","points.ao_mA")
+        ),
+        h("hr",{class:"sep"}),
+        h("div",{class:"row"},
+          h("div",{style:"flex:1"}, h("div",{class:"label"},"Datenpunkt‑Reserve [%]"),
+            h("input",{class:"input",type:"number",min:"0",max:"100", value:String((state.dpReservePct||0)*100),
+              oninput:e=>{ state.dpReservePct=Math.max(0, Math.min(100, Number(e.target.value||0)))/100; save(); }})
+          ),
+          h("div",{style:"flex:1"}, h("div",{class:"label"},"Ereignismodus (≤8 TXM)"),
+            h("select",{class:"input", onchange:e=>{ state.constraints.eventMode = e.target.value==="1"; save(); render(); }},
+              h("option",{value:"0", selected: state.constraints.eventMode?null:"selected"},"Nein"),
+              h("option",{value:"1", selected: state.constraints.eventMode?"selected":null},"Ja")
+            )
+          )
+        )
+      ),
+      h("div",{class:"card"},
+        h("div",{class:"label"},"Kommunikative DP / Bus"),
+        h("div",{class:"grid", style:"grid-template-columns:repeat(2,minmax(0,1fr))"},
+          numberInput("KNX Geräte","comm.knx.devices"),
+          numberInput("Modbus TCP Netze","comm.modbus.tcpNetworks"),
+          numberInput("Modbus RTU Segmente","comm.modbus.rtuSegments"),
+          numberInput("M‑Bus Geräte","comm.mbus.devices")
+        ),
+        h("hr",{class:"sep"}),
+        h("div",{class:"label"},"Schaltschrank"),
+        h("div",{class:"grid", style:"grid-template-columns:repeat(2,minmax(0,1fr))"},
+          numberInput("Baureihen‑Breite [mm]","cabinet.railWidth_mm"),
+          numberInput("24V Versorgung [A] (optional)","cabinet.supply24V_A")
+        )
+      )
+    )
+  );
+  return left;
+}
+
+let lastPlan=null;
+function run(){
+  try{
+    lastPlan = computePlan(state);
+    render();
+  }catch(e){
+    alert(e.message || String(e));
+  }
+}
+
+function results(){
+  if(!lastPlan) return h("div");
+  const headers = ["Prod Nr.","M.","G.","Tr.","Kurztext 1","Kürzel","Kategorie"];
+  const table = h("table",{class:"tbl"},
+    h("thead",{}, h("tr",{}, ...headers.map(hd=>h("th",{},hd)))),
+    h("tbody",{}, ...lastPlan.rows.map(r=>h("tr",{}, ...headers.map(hd=>h("td",{}, r[hd]||"")))))
+  );
+  const copy = ()=>{
+    const csv = [headers.join(";"), ...lastPlan.rows.map(r=> headers.map(hd=>`"${String(r[hd]||"").replace(/"/g,'""')}"`).join(";"))].join("\n");
+    navigator.clipboard.writeText(csv);
+    alert("Ergebnis (CSV) in Zwischenablage.");
+  };
+  return h("div",{class:"card"},
+    h("div",{class:"section-title"},
+      h("h3",{},"Ergebnis (SAP‑Layout)"),
+      h("div",{class:"row"},
+        h("div",{class:"tag"},"Controller: "+lastPlan.controller.label),
+        h("div",{class:"tag"},"Baureihen: "+lastPlan.mmRows),
+        h("div",{class:"tag"},"TXS: "+lastPlan.txsCount),
+        h("button",{class:"icon-btn",onclick:copy},"Copy CSV")
+      )
+    ),
+    table,
+    h("div",{class:"row",style:"margin-top:12px;gap:12px"},
+      h("div",{class:"tag"},"I/O Eingabe: "+lastPlan.kpis.totalIOInput),
+      h("div",{class:"tag"},"I/O Ziel: "+lastPlan.kpis.totalIOWithReserve),
+      h("div",{class:"tag"},"TXM-Bus: "+lastPlan.kpis.sumBus_mA+" mA"),
+      h("div",{class:"tag"},"Gesamtbreite: "+lastPlan.kpis.teWidthTotal_mm+" mm")
+    )
+  );
+}
+
+function trace(){
+  if(!lastPlan) return h("div");
+  return (
+    h("div",{class:"card"},
+      h("h3",{},"Rechenweg & Hinweise"),
+      h("ul",{}, ...lastPlan.trace.map(t=> h("li",{class:"small"},t)))
+    )
+  );
+}
+
+function deviceInfo(){
+  const list = [...CONTROLLERS, ...MODULES];
+  const stateObj = { q:"", index:0 };
+  const box = h("div",{class:"card"},
+    h("div",{class:"section-title"}, h("h3",{},"Geräte‑Info")),
+    h("div",{class:"row"},
+      h("input",{class:"input",placeholder:"Suchen (z.B. TXM1.8X, PXC7)", oninput:e=>{ stateObj.q=e.target.value.toLowerCase(); refresh(); }}),
+      h("select",{class:"input",onchange:e=>{ stateObj.index = Number(e.target.value); refresh(); }},
+        ...list.map((i,idx)=> h("option",{value:String(idx)}, i.id))
+      )
+    ),
+    h("div",{id:"device-info-body"})
+  );
+
+  function refresh(){
+    const filtered = list.filter(i=> (i.label||i.id).toLowerCase().includes(stateObj.q) || i.id.toLowerCase().includes(stateObj.q));
+    const idx = Math.min(stateObj.index, Math.max(filtered.length-1,0));
+    const sel = filtered[idx] || filtered[0];
+    const body = box.querySelector("#device-info-body");
+    body.innerHTML="";
+    if(!sel) return;
+    body.append(
+      h("div",{class:"card"},
+        h("h4",{}, sel.label||sel.id),
+        h("div",{class:"grid",style:"grid-template-columns:repeat(2,minmax(0,1fr))"},
+          h("div",{class:"small"},"Kategorie"), h("div",{}, sel.category||"Controller"),
+          h("div",{class:"small"},"Abmessungen (BxHxT)"), h("div",{}, (sel.dims?.w_mm||"-")+"×"+(sel.dims?.h_mm||"-")+"×"+(sel.dims?.d_mm||"-")+" mm"),
+          sel.txmBus_mA!=null ? h("div",{class:"small"},"TXM‑Bus (mA)") : null,
+          sel.txmBus_mA!=null ? h("div",{}, String(sel.txmBus_mA)) : null,
+          sel.maxIOPoints!=null ? h("div",{class:"small"},"Max. I/O") : null,
+          sel.maxIOPoints!=null ? h("div",{}, String(sel.maxIOPoints)) : null,
+          sel.internalTxmSupply_mA!=null ? h("div",{class:"small"},"Interne Bus‑Speisung (mA)") : null,
+          sel.internalTxmSupply_mA!=null ? h("div",{}, String(sel.internalTxmSupply_mA)) : null
+        )
+      )
+    );
+  }
+  refresh();
+  return box;
+}
+
+function render(){
+  const root = $("#app"); root.innerHTML="";
+  const header = h("div",{class:"row",style:"gap:12px;margin-bottom:12px;align-items:center"},
+    h("img",{src:"./favicon.svg",width:"28",height:"28"}),
+    h("h1",{},"TXIO Sizer"),
+    h("div",{class:"small"},"Auslegung von TX‑Modulen & PXC4/5/7 inkl. Reserve, Bus‑Caps & Baureihen")
+  );
+  const layout = h("div",{class:"layout"},
+    buildInputs(),
+    h("div",{class:"grid"}, results(), trace(), deviceInfo())
+  );
+  root.append(header, layout, h("div",{class:"small",style:"margin-top:16px"}, "© "+new Date().getFullYear()+" – TXIO Sizer • Upload‑only Build"));
+}
+
+render();
+window._txio_run = run;
