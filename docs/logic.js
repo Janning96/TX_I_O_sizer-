@@ -6,7 +6,7 @@ const ceilDiv = (a,b)=> Math.ceil(a/b);
 const clone = x => JSON.parse(JSON.stringify(x));
 const sumIO = p => (p.di||0)+(p.doRelay||0)+(p.doTriac||0)+(p.aiU||0)+(p.ai_mA||0)+(p.aiRTD||0)+(p.aoU||0)+(p.ao_mA||0)+(p.counters||0);
 
-function applyReserve(points, reservePct){
+function applyReserveToIO(points, reservePct){
   const total=sumIO(points);
   if(total===0||reservePct<=0) return clone(points);
   const target=Math.ceil(total*(1+reservePct));
@@ -24,93 +24,146 @@ function applyReserve(points, reservePct){
   return out;
 }
 
-function controllerCandidates(all, input){
-  const list = all.filter(c=>{
-    if(input.controllerFilter.compact===false && c.type==="compact") return false;
-    if(input.controllerFilter.modular===false && c.type==="modular") return false;
-    if(input.comm.knx.devices > (c.comm.knxMaxDevices||0)) return false;
-    if(input.comm.modbus.tcpNetworks > (c.comm.modbusTcpMaxNetworks||0)) return false;
-    if((input.comm.modbus.rtuSegments||0)>0 && (c.comm.rs485Ports||0)===0) return false;
-    return true;
-  });
-  return list;
+function intDpWithReserve(input){
+  const base = (input.comm?.modbus?.dp||0) + (input.comm?.mbus?.devices||0);
+  const r = input.dpReservePct||0;
+  return Math.ceil(base*(1+r));
 }
 
 function moduleAllowedByFeatureList(m, allowed){
   const f = m.features||{};
-  if(allowed.localOverride===false && f.localOverride) return false;
-  if(allowed.lcd===false && f.lcd) return false;
-  if(allowed.ledTriColor===false && f.ledTriColor) return false;
-  if(allowed.ledGreen===false && f.ledGreen) return false;
+  if(allowed?.localOverride===false && f.localOverride) return false;
+  if(allowed?.lcd===false && f.lcd) return false;
+  if(allowed?.ledTriColor===false && f.ledTriColor) return false;
+  if(allowed?.ledGreen===false && f.ledGreen) return false;
   return true;
 }
 
+// ---------- Onboard-Allocation (Kompakt-Controller) ----------
+function allocateOnboard(controller, need){
+  const out = clone(need);
+  const t = []; // trace
+  const ob = controller.onboard||{};
+
+  // PXC7: keine Onboard-IO
+  if(controller.type==="modular" || (ob.total||0)===0){
+    return { remaining: out, trace: t };
+  }
+
+  // DO Relais zuerst
+  if(ob.do){
+    const take = Math.min(out.doRelay||0, ob.do);
+    if(take>0){ out.doRelay -= take; t.push(`Onboard DO: ${take}/${ob.do} verwendet`); }
+  }
+
+  // PXC5: XIO zuerst für mA-Tasks
+  if(ob.xio && ob.xio>0){
+    let xioFree = ob.xio;
+    const aoSlots = ob.xioAo_mA_slots||0;
+
+    // AO 4–20 mA (max Slots und Kanäle)
+    if(aoSlots>0 && (out.ao_mA||0)>0){
+      const use = Math.min(out.ao_mA, aoSlots, xioFree);
+      if(use>0){
+        out.ao_mA -= use; xioFree -= use;
+        t.push(`Onboard XIO AO_mA: ${use}/${aoSlots} belegt (XIO Rest ${xioFree})`);
+      }
+    }
+    // AI 4–20 mA
+    if((out.ai_mA||0)>0 && xioFree>0){
+      const use = Math.min(out.ai_mA, xioFree);
+      out.ai_mA -= use; xioFree -= use;
+      t.push(`Onboard XIO AI_mA: ${use} belegt (XIO Rest ${xioFree})`);
+    }
+    // Restliche Signale könnten theoretisch auch über XIO laufen – wir lassen UIO davor den Vorzug
+  }
+
+  // UIO decken allgemeine Signale (ggf. auch AI_mA bei PXC4)
+  if(ob.uio && ob.uio>0){
+    let uioFree = ob.uio;
+
+    // Für PXC4: AI_mA kann UIO belegen (Datenblatt erlaubt 0/4–20 mA). Für PXC5 nutzen wir XIO bereits vorher.
+    if(controller.pn.startsWith("PXC4") && (out.ai_mA||0)>0){
+      const use = Math.min(out.ai_mA, uioFree);
+      out.ai_mA -= use; uioFree -= use;
+      t.push(`Onboard UIO AI_mA (PXC4): ${use} (UIO Rest ${uioFree})`);
+    }
+
+    // DI -> AI_U -> AO_U in dieser Reihenfolge
+    const order = ["di","aiU","aoU"];
+    for(const k of order){
+      if(uioFree<=0) break;
+      const needK = out[k]||0;
+      if(needK>0){
+        const use = Math.min(needK, uioFree);
+        out[k] -= use; uioFree -= use;
+        t.push(`Onboard UIO ${k}: ${use} (UIO Rest ${uioFree})`);
+      }
+    }
+  }
+
+  return { remaining: out, trace: t };
+}
+
+// ---------- TXM Packing ----------
 function packModules(targetIO, featureAllowed){
   const items=[]; const trace=[];
   const need=clone(targetIO);
 
-  const m8X = MODULES.find(m=>m.pn==="TXM1.8X");
+  const find = pn => MODULES.find(m=>m.pn===pn);
+
+  // AO 4–20 mA -> 8X / 8X-ML
   if(need.ao_mA>0){
-    const count = ceilDiv(need.ao_mA, 4);
-    if(!moduleAllowedByFeatureList(m8X,featureAllowed)) throw new Error("AO 4–20 mA gefordert, aber 8X durch Feature-Filter ausgeschlossen.");
-    items.push({pn:m8X.pn, qty:count});
-    trace.push(`AO 4–20 mA: ${need.ao_mA} ⇒ ${count}× TXM1.8X (AO 5–8).`);
+    const m = moduleAllowedByFeatureList(find("TXM1.8X"),featureAllowed) ? find("TXM1.8X") : find("TXM1.8X-ML");
+    if(!m) throw new Error("AO 4–20 mA gefordert, aber 8X/8X-ML ausgeschlossen.");
+    const c = ceilDiv(need.ao_mA, 4);
+    items.push({pn:m.pn, qty:c}); trace.push(`AO 4–20 mA: ${need.ao_mA} ⇒ ${c}× ${m.pn}`);
     need.ao_mA = 0;
   }
+  // AI 4–20 mA -> 8X / 8X-ML
   if(need.ai_mA>0){
-    const existing = items.find(it=>it.pn==="TXM1.8X");
-    const provided = (existing?existing.qty:0)*8;
-    const remain = Math.max(0, need.ai_mA - provided);
-    if(remain>0){
-      if(!moduleAllowedByFeatureList(m8X,featureAllowed)) throw new Error("AI 4–20 mA gefordert, aber 8X durch Feature-Filter ausgeschlossen.");
-      const add = ceilDiv(remain,8);
-      items.push({pn:m8X.pn, qty:add});
-      trace.push(`AI 4–20 mA zusätzlich: ${remain} ⇒ +${add}× TXM1.8X.`);
-    }else{
-      trace.push(`AI 4–20 mA: durch vorhandene TXM1.8X abgedeckt (${provided}).`);
-    }
+    const m = moduleAllowedByFeatureList(find("TXM1.8X"),featureAllowed) ? find("TXM1.8X") : find("TXM1.8X-ML");
+    if(!m) throw new Error("AI 4–20 mA gefordert, aber 8X/8X-ML ausgeschlossen.");
+    const c = ceilDiv(need.ai_mA, 8);
+    items.push({pn:m.pn, qty:c}); trace.push(`AI 4–20 mA: ${need.ai_mA} ⇒ ${c}× ${m.pn}`);
     need.ai_mA=0;
   }
-
+  // DO Relais -> 6R / 6R-M / 6RL
   if(need.doRelay>0){
-    const m6R = MODULES.find(m=>m.pn==="TXM1.6R");
-    const m6RM = MODULES.find(m=>m.pn==="TXM1.6R-M");
-    let choice = moduleAllowedByFeatureList(m6R,featureAllowed) ? m6R :
-                 (moduleAllowedByFeatureList(m6RM,featureAllowed) ? m6RM : null);
-    if(!choice) throw new Error("DO Relais gefordert, aber 6R/6R-M durch Feature-Filter ausgeschlossen.");
-    const c = ceilDiv(need.doRelay, choice.provide.doRelay);
-    items.push({pn:choice.pn, qty:c}); trace.push(`DO Relais: ${need.doRelay} ⇒ ${c}× ${choice.pn}.`);
+    const cand = ["TXM1.6R","TXM1.6R-M","TXM1.6RL"].map(find).filter(Boolean).find(m=> moduleAllowedByFeatureList(m,featureAllowed));
+    if(!cand) throw new Error("DO Relais gefordert, aber 6R/6R-M/6RL ausgeschlossen.");
+    const c = ceilDiv(need.doRelay, cand.provide.doRelay);
+    items.push({pn:cand.pn, qty:c}); trace.push(`DO Relais: ⇒ ${c}× ${cand.pn}`);
     need.doRelay=0;
   }
-
+  // DO Triac -> 8T
   if(need.doTriac>0){
-    const m = MODULES.find(m=>m.pn==="TXM1.8T");
-    if(!moduleAllowedByFeatureList(m,featureAllowed)) throw new Error("DO Triac gefordert, aber 8T durch Feature-Filter ausgeschlossen.");
+    const m = find("TXM1.8T");
+    if(!moduleAllowedByFeatureList(m,featureAllowed)) throw new Error("DO Triac gefordert, aber 8T ausgeschlossen.");
     const c = ceilDiv(need.doTriac, m.provide.doTriac);
-    items.push({pn:m.pn, qty:c}); trace.push(`DO Triac: ${need.doTriac} ⇒ ${c}× ${m.pn}.`);
+    items.push({pn:m.pn, qty:c}); trace.push(`DO Triac: ⇒ ${c}× ${m.pn}`);
     need.doTriac=0;
   }
-
+  // AI RTD -> 8P
   if(need.aiRTD>0){
-    const m = MODULES.find(m=>m.pn==="TXM1.8P");
-    if(!moduleAllowedByFeatureList(m,featureAllowed)) throw new Error("AI RTD/PT gefordert, aber 8P durch Feature-Filter ausgeschlossen.");
+    const m = find("TXM1.8P");
+    if(!moduleAllowedByFeatureList(m,featureAllowed)) throw new Error("AI RTD/PT gefordert, aber 8P ausgeschlossen.");
     const c = ceilDiv(need.aiRTD, m.provide.aiU);
-    items.push({pn:m.pn, qty:c}); trace.push(`AI RTD/PT: ${need.aiRTD} ⇒ ${c}× ${m.pn}.`);
+    items.push({pn:m.pn, qty:c}); trace.push(`AI RTD/PT: ⇒ ${c}× ${m.pn}`);
     need.aiRTD=0;
   }
-
-  const uioNeed = (need.aiU||0)+(need.aoU||0)+(need.di||0);
-  if(uioNeed>0){
-    const m8U = MODULES.find(m=>m.pn==="TXM1.8U");
-    const m4D3R = MODULES.find(m=>m.pn==="TXM1.4D3R");
-    if(moduleAllowedByFeatureList(m8U,featureAllowed)){
-      const c = ceilDiv(uioNeed, 8);
-      items.push({pn:m8U.pn, qty:c}); trace.push(`UIO (DI/AI/AO 0–10V): ${uioNeed} ⇒ ${c}× ${m8U.pn}.`);
-    }else if(moduleAllowedByFeatureList(m4D3R,featureAllowed)){
-      const c = ceilDiv(uioNeed, 7);
-      items.push({pn:m4D3R.pn, qty:c}); trace.push(`UIO Ersatz (4DI+3DO): ${uioNeed} ⇒ ${c}× ${m4D3R.pn}.`);
+  // Rest (DI, AI_U, AO_U) -> 8U (oder 4D3R fallback)
+  const rest = (need.aiU||0)+(need.aoU||0)+(need.di||0);
+  if(rest>0){
+    const m8U = find("TXM1.8U"); const m4D3R = find("TXM1.4D3R");
+    if(m8U && moduleAllowedByFeatureList(m8U,featureAllowed)){
+      const c = ceilDiv(rest, 8);
+      items.push({pn:m8U.pn, qty:c}); trace.push(`UIO Rest: ${rest} ⇒ ${c}× ${m8U.pn}`);
+    }else if(m4D3R && moduleAllowedByFeatureList(m4D3R,featureAllowed)){
+      const c = ceilDiv(rest, 7);
+      items.push({pn:m4D3R.pn, qty:c}); trace.push(`UIO Ersatz (4DI+3DO): ${rest} ⇒ ${c}× ${m4D3R.pn}`);
     }else{
-      throw new Error("UIO-Anteile gefordert, aber 8U/4D3R durch Feature-Filter ausgeschlossen.");
+      throw new Error("UIO-Anteile gefordert, aber 8U/4D3R ausgeschlossen.");
     }
   }
 
@@ -148,98 +201,110 @@ function priceOf(pn, priceMap){
 function bomToSapRows(controller, bom, includeSupplyCount){
   const rows = [];
   rows.push({ pn:controller.pn, qty:1 });
-  if(includeSupplyCount>0){
-    rows.push({ pn:"TXS1.12F10", qty:includeSupplyCount });
-  }
+  if(includeSupplyCount>0){ rows.push({ pn:"TXS1.12F10", qty:includeSupplyCount }); }
   bom.forEach(it=> rows.push({ pn:it.pn, qty:it.qty }));
   return rows.map(r=>{
     const cat = CATALOG[r.pn].item;
     return {
       "Leistungsnummer": r.pn,
       "Menge": r.qty,
-      "Basismengeneinheit": cat.base || "ST",
+      "Basismengeneinheit": "ST",
       "Kurztext": cat.texts?.kurz1 || "",
       "Kurztext 2": cat.texts?.kurz2 || ""
     };
   });
 }
 
-function costRows(sapRows, priceMap){
-  const lines = sapRows.map(r=>{
-    const pn = r["Leistungsnummer"];
-    const unit = priceOf(pn, priceMap);
-    const sum = (unit!=null) ? unit * (r["Menge"]||0) : null;
-    return { ...r, "_unit": unit, "_sum": sum };
-  });
-  const total = lines.every(l=> l._sum!=null) ? lines.reduce((s,l)=> s+l._sum,0) : null;
-  return { lines, total };
-}
-
+// -------------- Main Planner --------------
 export function computePlanForController(input, controller){
   const trace=[];
-  const totalIn = sumIO(input.points);
-  const targetTotal = Math.ceil(totalIn*(1+(input.dpReservePct||0)));
-  trace.push(`I/O gesamt: ${totalIn} | Reserve ${(input.dpReservePct*100).toFixed(0)}% ⇒ Ziel ${targetTotal}`);
 
-  if(targetTotal > controller.limits.ioOverall){
-    throw new Error(`${controller.pn}: DP-Ziel ${targetTotal} > Gesamtlimit ${controller.limits.ioOverall}`);
-  }
-  const integrCount = (input.comm.mbus.devices||0) + (input.comm.modbus.dp||0);
-  if(integrCount > controller.limits.integrDpMax){
-    throw new Error(`${controller.pn}: Integrations-DP ${integrCount} > Limit ${controller.limits.integrDpMax}`);
-  }
-  if(input.comm.knx.devices > controller.comm.knxMaxDevices){
-    throw new Error(`${controller.pn}: KNX Geräte ${input.comm.knx.devices} > Limit ${controller.comm.knxMaxDevices}`);
-  }
+  // Reserve getrennt: HW-I/O vs Integrations-DP
+  const ioWithReserve = applyReserveToIO(input.points, input.dpReservePct||0);
+  const HW_req = sumIO(ioWithReserve);
+  const INT_req = intDpWithReserve(input);
 
-  const targetIO = applyReserve(input.points, input.dpReservePct||0);
-  const packed = packModules(targetIO, input.featureAllow);
+  const lim = controller.limits||{};
+  const hwMax = lim.hwMax ?? lim.ioOverall ?? Infinity;
+  const intMax = lim.intMax ?? lim.integrDpMax ?? Infinity;
+  const combined = lim.totalCombinedMax ?? null;
+
+  trace.push(`DP inkl. Reserve: HW=${HW_req}, INT=${INT_req}${combined?`, SUM=${HW_req+INT_req}`:""}`);
+
+  if(HW_req>hwMax) throw new Error(`${controller.pn}: HW-DP ${HW_req} > Limit ${hwMax}`);
+  if(INT_req>intMax) throw new Error(`${controller.pn}: Integrations-DP ${INT_req} > Limit ${intMax}`);
+  if(combined!=null && (HW_req+INT_req)>combined) throw new Error(`${controller.pn}: Summe HW+INT ${HW_req+INT_req} > Gesamtlimit ${combined}`);
+
+  // Onboard-Deckung (nur für Kompakt-Controller)
+  const onboard = allocateOnboard(controller, ioWithReserve);
+  trace.push(...onboard.trace.map(s=>"Onboard: "+s));
+
+  // TXM-Pack für die Restbedarfe
+  const packed = packModules(onboard.remaining, input.featureAllow||{});
   trace.push(...packed.trace);
 
-  const busmA = sumBus_mA(packed.items);
-  const internal = controller.power.internalBus_mA||0;
+  // mA-Bilanz
+  const mA = sumBus_mA(packed.items);
+  const internal = controller.power?.internalBus_mA||0;
   let txsCount = 0;
-  if(busmA>internal){
-    const need = busmA - internal;
-    txsCount = ceilDiv(need, controller.power.txsPerUnit_mA||1200);
-    if(controller.power.txsMaxUnits!=null && txsCount>controller.power.txsMaxUnits){
-      throw new Error(`${controller.pn}: Erforderliche Speisemodule ${txsCount} > max ${controller.power.txsMaxUnits}`);
+  if(mA>internal){
+    const need = mA - internal;
+    txsCount = Math.ceil(need / (controller.power?.txsPerUnit_mA||1200));
+    if(controller.power?.txsMaxUnits!=null && txsCount>controller.power.txsMaxUnits){
+      throw new Error(`${controller.pn}: Speisemodule benötigt ${txsCount} > max ${controller.power.txsMaxUnits}`);
     }
   }
-  trace.push(`TXM-Bus: ${busmA} mA (intern ${internal}) ⇒ TXS ×${txsCount}`);
+  trace.push(`TXM-Bus: ${mA} mA (intern ${internal}) ⇒ TXS ×${txsCount}`);
 
-  const moduleCount = packed.items.reduce((s,it)=> s+it.qty,0);
-  const modeMax = input.constraints?.eventMode ? controller.limits.txmMode.event : controller.limits.txmMode.polling;
-  if(moduleCount > modeMax) throw new Error(`${controller.pn}: TXM-Module ${moduleCount} > Modus-Limit ${modeMax}`);
-  if(controller.limits.txmHardCap && moduleCount > controller.limits.txmHardCap) throw new Error(`${controller.pn}: TXM-Module ${moduleCount} > Hardcap ${controller.limits.txmHardCap}`);
+  // Moduslimit anhand TXM-Anzahl
+  const txmCount = packed.items.reduce((s,it)=> s+it.qty,0);
+  const modeMax = (input.constraints?.eventMode ? lim.txmMode?.event : lim.txmMode?.polling) ?? 64;
+  if(txmCount > modeMax) throw new Error(`${controller.pn}: TXM-Module ${txmCount} > Modus-Limit ${modeMax}`);
+  if(lim.txmHardCap && txmCount > lim.txmHardCap) throw new Error(`${controller.pn}: TXM-Module ${txmCount} > Hardcap ${lim.txmHardCap}`);
 
-  const rowsPacked = packRows(input.cabinet.railWidth_mm, controller, [
+  // Mechanik
+  const rowsPacked = packRows(input.cabinet?.railWidth_mm||600, controller, [
     ...(txsCount>0 ? [{ pn:"TXS1.12F10", qty:txsCount }] : []),
     ...packed.items
   ]);
   const mmRows = rowsPacked.rows.length;
   const totalWidth = rowsPacked.totalWidth;
-  trace.push(`Baureihen: ${mmRows} bei Breite ${input.cabinet.railWidth_mm} mm → Gesamtbreite ${totalWidth} mm.`);
+  trace.push(`Baureihen: ${mmRows} bei Breite ${input.cabinet?.railWidth_mm||600} mm → Gesamtbreite ${totalWidth} mm.`);
 
   const sapRows = bomToSapRows(controller, packed.items, txsCount);
 
   return {
     ok:true, controller, sapRows, trace,
-    kpis:{ totalIOInput: totalIn, totalIOWithReserve: targetTotal, sumBus_mA: busmA, totalWidth_mm: totalWidth, moduleCount, txsCount, mmRows }
+    kpis:{ HW_req, INT_req, sumBus_mA:mA, txsCount, txmCount, totalWidth_mm: totalWidth, mmRows }
   };
 }
 
 export function computeCandidates(input){
-  const cands = controllerCandidates(CONTROLLERS, input);
+  const list = CONTROLLERS.filter(c=>{
+    if(input.controllerFilter?.compact===false && c.type==="compact") return false;
+    if(input.controllerFilter?.modular===false && c.type==="modular") return false;
+    if((input.comm?.knx?.devices||0) > (c.comm?.knxMaxDevices||0)) return false;
+    if((input.comm?.modbus?.rtuSegments||0)>0 && (c.comm?.rs485Ports||0)===0) return false;
+    return true;
+  });
+
   const out = [];
-  cands.forEach(c=>{
-    try{
-      out.push(computePlanForController(input,c));
-    }catch(e){
-      // ignore failed; could collect reasons
-    }
+  list.forEach(c=>{
+    try{ out.push(computePlanForController(input,c)); }catch(e){ /* ignore */ }
   });
   return out;
+}
+
+// ---------------- Pricing & Selection ----------------
+function costRows(sapRows, priceMap){
+  const lines = sapRows.map(r=>{
+    const pn = r["Leistungsnummer"].toUpperCase();
+    const unit = priceMap ? priceMap[pn] : null;
+    const sum = (unit!=null) ? unit * (r["Menge"]||0) : null;
+    return { ...r, "_unit": unit, "_sum": sum };
+  });
+  const total = lines.every(l=> l._sum!=null) ? lines.reduce((s,l)=> s+l._sum,0) : null;
+  return { lines, total };
 }
 
 export function selectVariants(candidates, priceMap, opts={mode:"none", recommendDelta:0.10}){
@@ -252,12 +317,12 @@ export function selectVariants(candidates, priceMap, opts={mode:"none", recommen
 
   const onlyPriced = enriched.filter(e=> e.cost.total!=null);
   if(onlyPriced.length===0){
-    const first = candidates.sort((a,b)=> a.controller.limits.ioOverall - b.controller.limits.ioOverall)[0];
+    const first = candidates.sort((a,b)=> a.controller.limits.hwMax - b.controller.limits.hwMax)[0];
     return { cheapest:first, recommended:first, priced:false };
   }
 
   const cheapest = onlyPriced.sort((a,b)=> a.cost.total - b.cost.total
-    || a.plan.kpis.moduleCount - b.plan.kpis.moduleCount
+    || a.plan.kpis.txmCount - b.plan.kpis.txmCount
     || a.plan.kpis.sumBus_mA - b.plan.kpis.sumBus_mA
     || a.plan.kpis.totalWidth_mm - b.plan.kpis.totalWidth_mm
   )[0].plan;

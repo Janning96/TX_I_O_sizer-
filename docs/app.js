@@ -26,8 +26,8 @@ const defaultInputs = {
   pricing:{ map:{}, has:false, advisorMode:"none", recommendDelta:0.10 }
 };
 
-let state = JSON.parse(localStorage.getItem("txio_state_pro_full")||"null") || defaultInputs;
-const save = ()=> localStorage.setItem("txio_state_pro_full", JSON.stringify(state));
+let state = JSON.parse(localStorage.getItem("txio_state_pro_v2")||"null") || defaultInputs;
+const save = ()=> localStorage.setItem("txio_state_pro_v2", JSON.stringify(state));
 
 function numberInput(label, path, attrs={}){
   const inp = h("input",{class:"input", type:"number", min:"0", value:get(path)??0, oninput:e=>{ set(path, e.target.value===""?0:Number(e.target.value)); }});
@@ -208,17 +208,17 @@ function deviceInfo(){
     grid.append(...cell("Abmessungen (BxHxT)", `${it.dims?.w||"-"}×${it.dims?.h||"-"}×${it.dims?.d||"-"} mm`));
     if(it.current_mA!=null) grid.append(...cell("TXM‑Bus (mA)", String(it.current_mA)));
     if(it.type){
+      const lim = it.limits||{};
       grid.append(...cell("Typ", it.type));
-      grid.append(...cell("Max. I/O gesamt", String(it.limits?.ioOverall||"-")));
-      if(it.limits?.txmIoMax) grid.append(...cell("Max. I/O über TXM", String(it.limits.txmIoMax)));
-      grid.append(...cell("TXM Modullimit (Polling/Ereignis)", `${it.limits?.txmMode?.polling||"-"} / ${it.limits?.txmMode?.event||"-"}`));
-      if(it.limits?.txmHardCap) grid.append(...cell("TXM Hardcap", String(it.limits.txmHardCap)));
+      grid.append(...cell("Max. HW‑DP (TXM)", String(lim.hwMax||"-")));
+      grid.append(...cell("Max. Integrations‑DP", String(lim.intMax!=null?lim.intMax:"-")));
+      if(lim.totalCombinedMax!=null) grid.append(...cell("Gesamtdatenpunkte (kombiniert)", String(lim.totalCombinedMax)));
+      grid.append(...cell("TXM Moduslimit (Polling/Ereignis)", `${lim.txmMode?.polling||"-"} / ${lim.txmMode?.event||"-"}`));
+      if(lim.txmHardCap) grid.append(...cell("TXM Hardcap", String(lim.txmHardCap)));
       grid.append(...cell("Interne Bus-Speisung", `${it.power?.internalBus_mA||0} mA`));
       grid.append(...cell("Max. Speisemodule TXS1.12…", String(it.power?.txsMaxUnits||0)));
       grid.append(...cell("KNX max. Geräte", String(it.comm?.knxMaxDevices||0)));
-      grid.append(...cell("Modbus TCP max. Netze", String(it.comm?.modbusTcpMaxNetworks||0)));
       grid.append(...cell("RS485 Ports", String(it.comm?.rs485Ports||0)));
-      grid.append(...cell("M‑Bus Onboard (einfache Lasten)", String(it.comm?.mbusOnboardSimpleLoads||0)));
     }else if(it.features){
       grid.append(...cell("Kanäle / Signal", Object.entries(it.provide||{}).map(([k,v])=>`${k}=${v}`).join(", ")));
       grid.append(...cell("Lokale Übersteuerung", it.features.localOverride?"Ja":"–"));
@@ -271,7 +271,7 @@ function panelInputs(){
       numberInput("M‑Bus Geräte (gesamt)","comm.mbus.devices"),
       numberInput("Integrations‑DP (optional, Modbus/M‑Bus)","comm.modbus.dp")
     ),
-    h("div",{class:"small"},"KNX zählt nicht zu Integrations‑DP. M‑Bus Onboard: 4 einfache Lasten, mehr via Pegelwandler.")
+    h("div",{class:"small"},"KNX zählt nicht zu Integrations‑DP.")
   );
 
   const pointsBox = h("div",{class:"card"},
@@ -352,7 +352,6 @@ function panelInputs(){
 function resultPanel(){
   if(!lastCandidates) return h("div",{});
   const priceMap = state.pricing.has ? state.pricing.map : null;
-  let sections = [];
   const mode = state.pricing.advisorMode;
 
   function variantBlock(label, plan){
@@ -361,7 +360,9 @@ function resultPanel(){
     const tbl = tableEl(displayRows);
     const badges = [
       `Controller: ${plan.controller.pn}`,
-      `Module: ${plan.kpis.moduleCount}`,
+      `HW: ${plan.kpis.HW_req}`,
+      `INT: ${plan.kpis.INT_req}`,
+      `TXM: ${plan.kpis.txmCount}`,
       `TXS: ${plan.kpis.txsCount}`,
       `Bus: ${plan.kpis.sumBus_mA} mA`,
       `Reihen: ${plan.kpis.mmRows}`,
@@ -373,15 +374,14 @@ function resultPanel(){
       h("button",{class:"icon-btn",onclick:()=> downloadXlsxFull(state.projectName,label,displayRows)},"Excel (voll)"),
       h("button",{class:"icon-btn",onclick:()=> downloadPdf(label, displayRows, badges)},"PDF (Ergebnis)")
     );
-    const footer = (priceMap)? h("div",{class:"row", style:"margin-top:8px"},
-      h("span",{class:"badge good"}, "Gesamtkosten werden in Excel/PDF automatisch summiert")) : null;
-
     return h("div",{class:"card"},
       h("div",{class:"section-title"}, h("h3",{},`Ergebnis – ${label}`), h("div",{class:"row"}, ...badges.map(b=>h("span",{class:"badge"},b)), actions)),
-      tbl, footer
+      tbl,
+      h("div",{class:"card"}, h("div",{class:"small"}, "Rechenweg:"), h("ul",{}, ...plan.trace.map(t=> h("li",{class:"small"}, t))))
     );
   }
 
+  const sections = [];
   if(mode==="both" && lastSelection){
     sections.push(variantBlock("Günstigste", lastSelection.cheapest));
     if(lastSelection.recommended && lastSelection.recommended!==lastSelection.cheapest){
@@ -397,27 +397,18 @@ function resultPanel(){
   return h("div",{}, ...sections);
 }
 
-function tracePanel(){
-  if(!lastCandidates) return h("div",{});
-  const plan = lastSelection?.recommended || lastSelection?.cheapest || lastCandidates[0];
-  return h("div",{class:"card"},
-    h("h3",{},"Rechenweg & Hinweise"),
-    h("ul",{}, ...plan.trace.map(t=> h("li",{class:"small"}, t)))
-  );
-}
-
 function render(){
   const app = $("#app"); app.innerHTML="";
   const header = h("div",{class:"row",style:"gap:12px;margin-bottom:12px;align-items:center"},
     h("img",{src:"./favicon.svg",width:"28",height:"28"}),
-    h("h1",{},"TXIO Sizer PRO"),
+    h("h1",{},"TXIO Sizer PRO – v2 (kombinierte Limits)"),
     h("input",{class:"input", style:"max-width:280px", value: state.projectName, oninput:e=>{ state.projectName=e.target.value; save(); }})
   );
   const layout = h("div",{class:"layout"},
     h("div",{}, panelInputs()),
-    h("div",{class:"grid"}, resultPanel(), tracePanel(), deviceInfo())
+    h("div",{class:"grid"}, resultPanel(), deviceInfo())
   );
-  app.append(header, layout, h("footer",{}, h("div",{class:"small"},"© "+new Date().getFullYear()+" – TXIO Sizer PRO • Upload‑only Build")));
+  app.append(header, layout);
 }
 
 render();
